@@ -74,13 +74,24 @@ def get_service():
 def load_log():
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE) as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError as e:
+                sys.exit(
+                    f"{LOG_FILE} is corrupted and can't be parsed ({e}).\n"
+                    "It may have been left mid-write by a crash or Ctrl+C. Fix or remove it "
+                    "manually to continue (removing it loses per-sender history, not any Gmail state)."
+                )
     return {}
 
 
 def save_log(log):
-    with open(LOG_FILE, "w") as f:
+    """Write via a temp file + atomic rename so a crash/Ctrl+C mid-write can't corrupt the log —
+    this is called once per sender, so it runs very frequently during a long bulk run."""
+    tmp_path = LOG_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(log, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, LOG_FILE)
 
 
 def parse_list_unsubscribe(value):
@@ -233,7 +244,14 @@ def scan(service, query, limit):
                     ),
                     request_id=mid,
                 )
-            execute_batch_with_retry(batch)
+            try:
+                execute_batch_with_retry(batch)
+            except Exception as e:
+                # A whole batch failing after retries shouldn't kill the entire scan — treat
+                # every id in it as failed so it gets one more shot in the retry-round pass.
+                print(f"  warning: batch {i}-{i + len(chunk)} failed after retries ({e}), "
+                      "will retry individually later")
+                failed_ids.extend(chunk)
             print(f"  {label} {min(i + BATCH_SIZE, len(id_list))}/{len(id_list)}...")
             if len(failed_ids) > before:
                 delay = min(delay * 2, MAX_BATCH_DELAY)
@@ -328,11 +346,23 @@ def trash_messages(service, message_ids):
     return trashed
 
 
+CLEANUP_LIST_CAP = 20000
+
+
 def offer_trash_cleanup(service, addr, log, dry_run, auto=False):
-    """After a successful unsubscribe, offer to move that sender's existing emails to Trash."""
-    ids = list_message_ids(service, f"from:{addr}")
+    """After a successful unsubscribe, offer to move that sender's existing emails to Trash.
+    Never lets an API error here propagate — this runs once per sender inside long bulk loops,
+    and one bad sender shouldn't take down everything after it."""
+    try:
+        ids = list_message_ids(service, f"from:{addr}", cap=CLEANUP_LIST_CAP)
+    except Exception as e:
+        print(f"  warning: could not list {addr}'s mail for cleanup, skipping ({e})")
+        return
     if not ids:
         return
+    if len(ids) >= CLEANUP_LIST_CAP:
+        print(f"  note: {addr} has {CLEANUP_LIST_CAP}+ matching messages; only the first "
+              f"{CLEANUP_LIST_CAP} will be trashed this pass — run --cleanup again to catch the rest.")
     if not auto:
         choice = input(
             f"  Also move their {len(ids)} existing email(s) to Trash (recoverable for 30 days)? [y/n]: "
@@ -342,11 +372,19 @@ def offer_trash_cleanup(service, addr, log, dry_run, auto=False):
     if dry_run:
         print(f"  [dry-run] would move {len(ids)} email(s) to Trash.")
         return
-    trashed = trash_messages(service, ids)
+    try:
+        trashed = trash_messages(service, ids)
+    except Exception as e:
+        print(f"  warning: failed to move {addr}'s mail to Trash, skipping ({e})")
+        return
     print(f"  Moved {trashed} email(s) to Trash.")
     entry = log.setdefault(addr, {})
-    entry["cleaned_at"] = datetime.now(timezone.utc).isoformat()
-    entry["trashed_count"] = trashed
+    entry["trashed_count"] = entry.get("trashed_count", 0) + trashed
+    if len(ids) < CLEANUP_LIST_CAP:
+        entry["cleaned_at"] = datetime.now(timezone.utc).isoformat()
+    # else: truncated at the cap — leave cleaned_at unset so --cleanup revisits this sender
+    # (already-trashed messages drop out of the default from: search, so the next pass
+    # naturally picks up where this one left off)
     save_log(log)
 
 
@@ -461,7 +499,7 @@ def cleanup_mode(service, log, dry_run, auto=False):
 def trash_query_mode(service, query, dry_run, auto):
     """Move every message matching a Gmail query straight to Trash — no unsubscribe
     attempt, for cleaning up senders with no usable List-Unsubscribe header."""
-    ids = list_message_ids(service, query, cap=20000)
+    ids = list_message_ids(service, query, cap=CLEANUP_LIST_CAP)
     if not ids:
         print(f"No messages match {query!r}.")
         return
@@ -498,9 +536,13 @@ def verify_mode(service, log):
             continue
         checked += 1
         date_str = unsub_date.strftime("%Y/%m/%d")
-        resp = execute_with_retry(service.users().messages().list(
-            userId="me", q=f"from:{addr} after:{date_str}", maxResults=5
-        ))
+        try:
+            resp = execute_with_retry(service.users().messages().list(
+                userId="me", q=f"from:{addr} after:{date_str}", maxResults=5
+            ))
+        except Exception as e:
+            print(f"? {addr}: could not check ({e})")
+            continue
         count = len(resp.get("messages", []))
         if count > 0:
             print(f"⚠ {addr}: still received mail {days_since}d after unsubscribing — may not have worked")
