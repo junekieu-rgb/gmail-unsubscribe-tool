@@ -1,0 +1,8 @@
+credentials.json
+client_secret*.json
+token.json
+unsubscribe_log.json
+__pycache__/
+*.pyc
+.venv/
+.claude/
